@@ -1,0 +1,38 @@
+# Resume-Builder scorer sidecar — serves ATS, HR, and evidence-match scoring
+# via FastAPI on port 8100. Tailoring (POST /agent/tailor) requires the private
+# cloud/ package (not in the public repo); scoring (POST /score/both, POST /api/match)
+# works out of the box with just an ANTHROPIC_API_KEY for evidence matching.
+#
+# The ../Resume-Builder directory is bind-mounted over /app at runtime so that
+# local edits are reflected without rebuilding. The COPY . . layer is therefore
+# superseded at run-time; it still bakes a runnable image for the case where no
+# volume is attached.
+#
+# Runtime writes (embed_cache, audit_log) go to the bind-mounted /app, so the
+# volume must be rw (not :ro). See docker-compose.yml.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Install dependencies first (leverages Docker layer cache on requirements changes).
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source (overridden at runtime by the bind-mount from the host).
+COPY . .
+
+EXPOSE 8100
+
+# Health is served at GET /health (no auth required, no model needed).
+# python:3.11-slim has no curl; use the stdlib.
+HEALTHCHECK --interval=15s --timeout=10s --start-period=120s --retries=10 \
+    CMD python -c "import urllib.request, sys; \
+        r = urllib.request.urlopen('http://localhost:8100/health', timeout=5); \
+        sys.exit(0 if r.status == 200 else 1)"
+
+CMD ["python", "scorer_server.py", "--host", "0.0.0.0", "--port", "8100"]

@@ -483,6 +483,13 @@ class AgentTailorRequest(BaseModel):
     resume_text: Optional[str] = Field(
         None, description="Optional one-off resume text for this run only; never saved to the account"
     )
+    # Job Radar integration: identifying details of the posting this run is
+    # for. Passed back to Job Radar via the mark-applied callback when the run
+    # succeeds (see job_radar_integration.mark_applied); ignored entirely when
+    # JOB_RADAR_URL is not configured, so the cloud deployment is unchanged.
+    company_name: str = Field("", description="Hiring company (for the completion callback)")
+    job_title: str = Field("", description="Role title (for the completion callback)")
+    apply_url: str = Field("", description="Posting URL (for the completion callback)")
 
 
 class AgentCoverLetterRequest(BaseModel):
@@ -1124,6 +1131,16 @@ def _agent_key_status() -> Dict[str, Any]:
     return {"status": _agent_key_state["status"], "detail": _agent_key_state["detail"]}
 
 
+def _local_tailor_configured() -> bool:
+    """Whether local tailor runs have any usable model target at all."""
+    if (os.getenv("TAILOR_BASE_URL") or "").strip():
+        return True
+    provider = (os.getenv("TAILOR_PROVIDER") or "").strip().lower()
+    if provider == "claude":
+        return bool((os.getenv("ANTHROPIC_API_KEY") or "").strip())
+    return False
+
+
 @app.get("/health")
 def health():
     """Server status, model availability, and usage stats."""
@@ -1150,6 +1167,19 @@ def health():
             "api_key": agent_key["status"],
             "detail": agent_key["detail"],
             "features_available": agent_key["status"] == "ok",
+        },
+        # Job Radar integration (optional; set JOB_RADAR_URL to enable).
+        "job_radar": {
+            "callback_configured": bool(
+                os.getenv("JOB_RADAR_URL", "").strip()
+            ),
+            # What a local tailor run will call. On-prem-first: the
+            # OpenAI-compatible base URL when configured, Claude only by
+            # explicit opt-in, "unconfigured" with setup copy otherwise.
+            "local_tailor": (
+                (os.getenv("TAILOR_BASE_URL") or "").strip().rstrip("/")
+                or ("claude" if _local_tailor_configured() else "unconfigured")
+            ),
         },
         "cache_size": len(_score_cache),
         "auth_required": _config["require_auth"],
@@ -2771,14 +2801,20 @@ def _friendly_agent_error(kind: str, error_code: Optional[str] = None) -> str:
 def _run_tailor_in_background(
     run_id: str, user_id: int, tier: str, jd_text: str,
     instruction: Optional[str], resume_text: Optional[str],
+    job_radar_meta: Optional[dict] = None,
 ) -> None:
     """Background execution for POST /agent/tailor.
 
     Opens its OWN fresh connection -- a request-scoped connection must never
     cross into a BackgroundTasks callable. Starlette runs a plain ``def``
     background callable via a worker thread pool, and cloud.db.get_conn()
-    does not pass ``check_same_thread=False``, so a connection created on
-    the request's thread would raise the moment this thread touched it.
+    does not pass ``check_same_thread=False``, so a connection created on the
+    request's thread would raise the moment this thread touched it.
+
+    On success, if the caller supplied Job Radar posting details
+    (job_radar_meta: company/title/apply_url) the completion callback fires so
+    Job Radar records the application; failures there are logged and dropped,
+    never surfaced to a response that has already left the building.
     """
     conn = db_get_conn(cloud_settings.DB_PATH)
     try:
@@ -2787,10 +2823,29 @@ def _run_tailor_in_background(
         ctx = agent_tools.ToolContext(
             user_id=user_id, tier=tier, conn=conn, run_id=run_id, slot_reserved=True,
         )
-        agent_tools.dispatch(
+        result = agent_tools.dispatch(
             "run_resume_team", ctx,
             jd_text=jd_text, instruction=instruction, resume_text=resume_text,
         )
+        if (
+            isinstance(result, dict)
+            and result.get("status") == "succeeded"
+            and job_radar_meta
+        ):
+            # Job Radar records the application from the posting identity that
+            # came in with the enqueue call; there is no CV folder on this path,
+            # so the callback keys on company/URL/title alone.
+            try:
+                from job_radar_integration import mark_applied
+
+                mark_applied(
+                    company=job_radar_meta.get("company_name"),
+                    url=job_radar_meta.get("apply_url"),
+                    title=job_radar_meta.get("job_title"),
+                    folder=None,
+                )
+            except Exception as exc:  # noqa: BLE001 -- fire-and-forget callback
+                print(f"[/agent/tailor background] Job Radar callback failed: {exc}")
     except Exception as exc:  # noqa: BLE001 -- fire-and-forget background task
         # run_resume_team already converts every internal failure into a
         # recorded 'failed' agent_runs row and returns normally rather than
@@ -2861,9 +2916,22 @@ def agent_tailor_enqueue(
     _acquire_agent_slot()
     try:
         _reserve_agent_run_slot(user_id, tier, "tailor", run_id, jd_text, req.instruction)
+        # Job Radar passes the posting's identity along with the JD; the
+        # background runner hands it to the completion callback. Empty
+        # strings from other callers keep the old behaviour.
+        job_radar_meta = (
+            {
+                "company_name": req.company_name or "",
+                "job_title": req.job_title or "",
+                "apply_url": req.apply_url or "",
+            }
+            if (req.company_name or req.job_title or req.apply_url)
+            else None
+        )
         background_tasks.add_task(
             _in_agent_slot, _run_tailor_in_background,
             run_id, user_id, tier, jd_text, req.instruction, provided_resume or None,
+            job_radar_meta,
         )
     except BaseException:
         _agent_run_slots.release()  # nothing will run, so nothing will release it
@@ -2942,6 +3010,237 @@ def agent_run_status(run_id: str, auth=Depends(verify_api_key)):
             else None
         ),
     }
+
+
+# =============================================================================
+# LOCAL TAILOR RUNS (self-contained, on-prem-first)
+# =============================================================================
+# The /agent/* endpoints above belong to the hosted-SaaS surface and need the
+# private cloud/ package (auth, runs DB, quotas), which this checkout does not
+# ship - they answer 501/503 locally. The endpoints below give the Job Radar
+# integration a self-contained lifecycle with no cloud package and no
+# third-party dependency:
+#
+#   POST /agent/tailor/local         -> {"run_id"} (202)
+#   GET  /agent/runs/local/{run_id} -> {status, result, error}
+#
+# Model resolution (see _local_tailor_target) is on-prem by design: any
+# OpenAI-compatible endpoint (vLLM, Ollama, LiteLLM, an internal gateway) via
+#   TAILOR_BASE_URL, TAILOR_MODEL, TAILOR_API_KEY (optional), TAILOR_TIMEOUT
+# and Claude only as an explicit future opt-in:
+#   TAILOR_PROVIDER=claude + ANTHROPIC_API_KEY (+ optional TAILOR_MODEL)
+# No public-provider URL appears anywhere in this path.
+#
+# Runs live in an in-memory dict guarded by the same 8-slot semaphore: a
+# restart forgets in-flight runs (Job Radar's poller then fails them with
+# "lost contact", which is the honest outcome). The tailored resume is a
+# single-LLM DRAFT, not the four-role audited resume-team pipeline: the full
+# pipeline (candidate-fit preflight, evidence/human-voice audits, authorized
+# DOCX) is the interactive Codex path and stays untouched.
+
+_local_runs: Dict[str, Dict[str, Any]] = {}
+_local_runs_lock = threading.Lock()
+
+
+class LocalTailorRunRequest(BaseModel):
+    """Submit a local tailor run; the same shape Job Radar sends to /agent/tailor."""
+    jd_text: str = Field(..., description="Job description text")
+    resume_text: str = Field(..., description="Resume text to tailor")
+    company_name: str = Field("", description="Hiring company (completion callback)")
+    job_title: str = Field("", description="Role title (completion callback)")
+    apply_url: str = Field("", description="Posting URL (completion callback)")
+    instruction: Optional[str] = Field(None, description="Optional free-text guidance")
+
+
+def _local_tailor_target() -> Dict[str, Any]:
+    """Resolve which model a local tailor run calls. On-prem by design.
+
+    Priority:
+      1. TAILOR_PROVIDER=claude + ANTHROPIC_API_KEY -> Claude (explicit future
+         opt-in; nothing sends data to Anthropic unless you ask for it).
+      2. TAILOR_BASE_URL -> any OpenAI-compatible endpoint (vLLM, Ollama,
+         LiteLLM, internal gateway). TAILOR_API_KEY is optional because an
+         on-prem endpoint often runs without auth.
+      3. Nothing configured -> HTTP 503 with setup copy, not a fallback to
+         some public provider: independence from third parties is the point.
+    """
+    provider = (os.getenv("TAILOR_PROVIDER") or "").strip().lower()
+    anthropic_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if provider == "claude" or (not provider and not os.getenv("TAILOR_BASE_URL") and anthropic_key):
+        if not anthropic_key:
+            raise HTTPException(
+                status_code=503,
+                detail="TAILOR_PROVIDER=claude but ANTHROPIC_API_KEY is not set.",
+            )
+        return {"provider": "claude", "model": (os.getenv("TAILOR_MODEL") or "claude-sonnet-5").strip()}
+
+    base_url = (os.getenv("TAILOR_BASE_URL") or "").strip().rstrip("/")
+    if base_url:
+        # Auth is optional for an on-prem endpoint; when the endpoint DOES need
+        # a key but TAILOR_API_KEY is unset, fall back to the deployment's
+        # standard OPENROUTER_API_KEY (the compose stack passes it to this
+        # container) rather than refusing a config the user considers complete.
+        api_key = (os.getenv("TAILOR_API_KEY") or "").strip() \
+            or (os.getenv("OPENROUTER_API_KEY") or "").strip()
+        return {
+            "provider": "openai-compatible",
+            "base_url": base_url,
+            "model": (os.getenv("TAILOR_MODEL") or "").strip(),
+            "api_key": api_key,
+            "timeout": int((os.getenv("TAILOR_TIMEOUT") or "180").strip()),
+        }
+
+    raise HTTPException(
+        status_code=503,
+        detail=("No tailoring model configured. Set TAILOR_BASE_URL (and optionally "
+                "TAILOR_MODEL, TAILOR_API_KEY) for your on-prem OpenAI-compatible "
+                "endpoint, or TAILOR_PROVIDER=claude with ANTHROPIC_API_KEY."),
+    )
+
+
+def _local_model_call(jd_text: str, resume_text: str, instruction: Optional[str]) -> str:
+    """One LLM completion that tailors the resume against the configured
+    on-prem endpoint (or explicitly opted-in Claude)."""
+    system = (
+        "You are an expert resume writer. Tailor the given resume to the given "
+        "job description. Rules: keep every fact exactly as it is (titles, "
+        "companies, dates, education, skills) - never invent or embellish; "
+        "reorder and emphasize what matches the job; mirror the job's keywords "
+        "where they are truthful; keep it plain and human, no marketing voice, "
+        "no invented metrics. Output only the tailored resume as markdown, "
+        "no commentary."
+    )
+    user = f"JOB DESCRIPTION:\n{jd_text}\n\nRESUME:\n{resume_text}"
+    if instruction:
+        user += f"\n\nADDITIONAL INSTRUCTION:\n{instruction}"
+
+    target = _local_tailor_target()
+    if target["provider"] == "claude":
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=(os.getenv("ANTHROPIC_API_KEY") or "").strip())
+        message = client.messages.create(
+            model=target["model"],
+            max_tokens=8000,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        parts = [b.text for b in message.content if getattr(b, "type", "") == "text"]
+        draft = "".join(parts).strip()
+    else:
+        if not target["model"]:
+            raise HTTPException(
+                status_code=503,
+                detail="TAILOR_BASE_URL is set but TAILOR_MODEL is missing - name the model to call.",
+            )
+        import urllib.request
+
+        headers = {"Content-Type": "application/json"}
+        if target["api_key"]:
+            headers["Authorization"] = f"Bearer {target['api_key']}"
+        payload = json.dumps({
+            "model": target["model"],
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{target['base_url']}/chat/completions",
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=target["timeout"]) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        draft = (body.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        draft = draft.strip()
+
+    if not draft:
+        raise HTTPException(status_code=502, detail="The model returned an empty draft.")
+    return draft
+
+
+def _run_local_tailor_in_background(run_id: str, req: LocalTailorRunRequest) -> None:
+    """Background half of the local tailor lifecycle: model call, state, callback."""
+    try:
+        draft = _local_model_call(req.jd_text, req.resume_text, req.instruction)
+        with _local_runs_lock:
+            _local_runs[run_id].update(
+                status="succeeded",
+                result={
+                    "draft": draft,
+                    "company_name": req.company_name,
+                    "job_title": req.job_title,
+                    "apply_url": req.apply_url,
+                },
+                error=None,
+            )
+        # Same fire-and-forget completion callback as the cloud path.
+        try:
+            from job_radar_integration import mark_applied
+
+            mark_applied(
+                company=req.company_name or None,
+                url=req.apply_url or None,
+                title=req.job_title or None,
+                folder=None,
+            )
+        except Exception as exc:  # noqa: BLE001 -- callback never fails the run
+            print(f"[/agent/tailor/local background] Job Radar callback failed: {exc}")
+    except HTTPException as exc:
+        with _local_runs_lock:
+            _local_runs[run_id].update(status="failed", error=str(exc.detail))
+    except Exception as exc:  # noqa: BLE001 -- any other failure fails the run
+        with _local_runs_lock:
+            _local_runs[run_id].update(
+                status="failed", error=f"The tailoring model call did not succeed ({exc}).")
+
+
+@app.post("/agent/tailor/local")
+def agent_tailor_local(req: LocalTailorRunRequest):
+    """Enqueue a local tailor run (no cloud package, no auth, no DB)."""
+    jd_text = (req.jd_text or "").strip()
+    resume_text = (req.resume_text or "").strip()
+    if not jd_text:
+        raise HTTPException(status_code=400, detail="jd_text is required.")
+    if not resume_text:
+        raise HTTPException(status_code=400, detail="resume_text is required.")
+
+    run_id = uuid.uuid4().hex
+    with _local_runs_lock:
+        _local_runs[run_id] = {"status": "queued", "result": None, "error": None}
+    _acquire_agent_slot()
+    try:
+        threading.Thread(
+            target=_in_agent_slot,
+            args=(_run_local_tailor_in_background, run_id, req),
+            daemon=True,
+            name=f"local-tailor-{run_id[:8]}",
+        ).start()
+    except BaseException:
+        _agent_run_slots.release()
+        with _local_runs_lock:
+            del _local_runs[run_id]
+        raise
+    return JSONResponse(status_code=202, content={"run_id": run_id})
+
+
+@app.get("/agent/runs/local/{run_id}")
+def agent_local_run_status(run_id: str):
+    """Poll a local tailor run: {status: queued|running|succeeded|failed, result, error}."""
+    with _local_runs_lock:
+        run = _local_runs.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        # queued -> running: there is no separate runner step to mark it, and
+        # the caller only needs "not terminal yet".
+        status = "running" if run["status"] == "queued" else run["status"]
+        return {
+            "status": status,
+            "result": run["result"] if status == "succeeded" else None,
+            "error": run["error"] if status == "failed" else None,
+        }
 
 
 # =============================================================================
