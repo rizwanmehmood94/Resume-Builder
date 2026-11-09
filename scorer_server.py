@@ -41,6 +41,7 @@ import json
 import logging
 import re
 import statistics
+import subprocess
 import tempfile
 import threading
 import uuid
@@ -3022,6 +3023,7 @@ def agent_run_status(run_id: str, auth=Depends(verify_api_key)):
 # third-party dependency:
 #
 #   POST /agent/tailor/local         -> {"run_id"} (202)
+#   POST /agent/tailor/local/package -> {"run_id"} (202)
 #   GET  /agent/runs/local/{run_id} -> {status, result, error}
 #
 # Model resolution (see _local_tailor_target) is on-prem by design: any
@@ -3040,6 +3042,7 @@ def agent_run_status(run_id: str, auth=Depends(verify_api_key)):
 
 _local_runs: Dict[str, Dict[str, Any]] = {}
 _local_runs_lock = threading.Lock()
+_local_artifact_root = Path(os.getenv("JOBRADAR_ARTIFACT_ROOT", "/data/jobradar-artifacts"))
 
 
 class LocalTailorRunRequest(BaseModel):
@@ -3161,19 +3164,168 @@ def _local_model_call(jd_text: str, resume_text: str, instruction: Optional[str]
     return draft
 
 
-def _run_local_tailor_in_background(run_id: str, req: LocalTailorRunRequest) -> None:
+def _local_cover_letter_call(jd_text: str, resume_text: str, company: str, title: str,
+                             instruction: Optional[str]) -> str:
+    """Generate a factual, plain-text letter only when local packaging enables it."""
+    system = (
+        "You write concise cover letters. Use only facts found in the resume; never invent "
+        "metrics, qualifications, employers, or experience. Return only a letter in markdown "
+        "with a greeting, two or three short paragraphs, and a closing."
+    )
+    user = (
+        f"JOB DESCRIPTION:\n{jd_text}\n\nRESUME:\n{resume_text}\n\n"
+        f"COMPANY: {company or 'Hiring team'}\nROLE: {title or 'the advertised role'}"
+    )
+    if instruction:
+        user += f"\n\nADDITIONAL INSTRUCTION:\n{instruction}"
+    target = _local_tailor_target()
+    if target["provider"] == "claude":
+        import anthropic
+        message = anthropic.Anthropic(api_key=(os.getenv("ANTHROPIC_API_KEY") or "").strip()).messages.create(
+            model=target["model"], max_tokens=1600, system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = "".join(block.text for block in message.content if getattr(block, "type", "") == "text")
+    else:
+        if not target["model"]:
+            raise HTTPException(status_code=503, detail="TAILOR_BASE_URL is set but TAILOR_MODEL is missing.")
+        import urllib.request
+        headers = {"Content-Type": "application/json"}
+        if target["api_key"]:
+            headers["Authorization"] = f"Bearer {target['api_key']}"
+        request = urllib.request.Request(
+            f"{target['base_url']}/chat/completions",
+            data=json.dumps({"model": target["model"], "max_tokens": 1600,
+                             "messages": [{"role": "system", "content": system},
+                                          {"role": "user", "content": user}]}).encode("utf-8"),
+            headers=headers, method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=target["timeout"]) as response:
+            text = (json.loads(response.read().decode("utf-8")).get("choices") or [{}])[0].get(
+                "message", {}).get("content", "")
+    if not (text or "").strip():
+        raise HTTPException(status_code=502, detail="The model returned an empty cover letter.")
+    return text.strip()
+
+
+def _publish_local_resume_docx(run_id: str, draft: str) -> Dict[str, str]:
+    """Render an explicitly unverified local draft into Job Radar's shared artifact root."""
+    from docx_generator import create_ats_resume, parse_resume_markdown
+
+    destination_dir = _local_artifact_root / run_id
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / "resume.docx"
+    temporary = destination_dir / ".resume.docx.tmp"
+    data = parse_resume_markdown(draft)
+    try:
+        create_ats_resume(
+            output_path=str(temporary),
+            name=data["name"],
+            contact_info=data["contact_info"],
+            summary=data["summary"],
+            core_competencies=data["core_competencies"],
+            experience=data["experience"],
+            education=data["education"],
+            certifications=data["certifications"],
+            professional_memberships=data.get("professional_memberships"),
+            publications=data.get("publications"),
+            publications_footer=data.get("publications_footer"),
+            projects=data.get("projects"),
+        )
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise ValueError("DOCX packaging did not produce a document.")
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {
+        "key": f"{run_id}/resume.docx",
+        "filename": "Tailored_Resume.docx",
+        "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+
+
+def _publish_local_cover_letter_docx(run_id: str, draft: str, company: str, title: str) -> Dict[str, str]:
+    """Render a best-effort local cover letter without invoking the audited native pipeline."""
+    from docx_generator import create_ats_cover_letter, parse_cover_letter_markdown
+
+    destination_dir = _local_artifact_root / run_id
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / "cover-letter.docx"
+    temporary = destination_dir / ".cover-letter.docx.tmp"
+    data = parse_cover_letter_markdown(draft)
+    data["recipient_info"]["company"] = company or data["recipient_info"].get("company", "Hiring Team")
+    try:
+        create_ats_cover_letter(
+            output_path=str(temporary), name=data["name"], contact_info=data["contact_info"],
+            date=data["date"] or datetime.now().strftime("%B %d, %Y"),
+            recipient_info=data["recipient_info"], job_title=title or data["job_title"],
+            paragraphs=data["paragraphs"], closing=data.get("closing", "Sincerely,"),
+        )
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise ValueError("Cover-letter DOCX packaging did not produce a document.")
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {"key": f"{run_id}/cover-letter.docx", "filename": "Tailored_Cover_Letter.docx",
+            "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+
+
+def _publish_pdf(docx_artifact: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Optionally convert an artifact with a local soffice installation; never fail the run."""
+    if (os.getenv("JOBRADAR_ENABLE_PDF") or "").strip().lower() not in {"1", "true", "yes"}:
+        return None
+    source = _local_artifact_root / docx_artifact["key"]
+    try:
+        subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(source.parent), str(source)],
+                       check=True, capture_output=True, timeout=60)
+        pdf = source.with_suffix(".pdf")
+        if not pdf.is_file() or pdf.stat().st_size == 0:
+            raise ValueError("PDF conversion did not produce a document.")
+        return {"key": str(pdf.relative_to(_local_artifact_root)).replace("\\", "/"),
+                "filename": docx_artifact["filename"].removesuffix(".docx") + ".pdf",
+                "media_type": "application/pdf"}
+    except Exception as exc:  # noqa: BLE001 -- PDF is strictly optional
+        print(f"[/agent/tailor/local background] PDF conversion skipped: {exc}")
+        return None
+
+
+def _run_local_tailor_in_background(run_id: str, req: LocalTailorRunRequest, package: bool = False) -> None:
     """Background half of the local tailor lifecycle: model call, state, callback."""
     try:
         draft = _local_model_call(req.jd_text, req.resume_text, req.instruction)
+        result = {
+            "draft": draft,
+            "company_name": req.company_name,
+            "job_title": req.job_title,
+            "apply_url": req.apply_url,
+        }
+        if package:
+            # This is intentionally separate from the receipt-verified ResumeHQ pipeline.
+            # It publishes a convenience render of a single local-model draft only.
+            resume_artifact = _publish_local_resume_docx(run_id, draft)
+            result["resume_artifact"] = resume_artifact
+            resume_pdf = _publish_pdf(resume_artifact)
+            if resume_pdf:
+                result["resume_pdf_artifact"] = resume_pdf
+            if (os.getenv("JOBRADAR_ENABLE_COVER_LETTER") or "").strip().lower() in {"1", "true", "yes"}:
+                try:
+                    cover_draft = _local_cover_letter_call(
+                        req.jd_text, req.resume_text, req.company_name, req.job_title, req.instruction)
+                    result["cover_letter_draft"] = cover_draft
+                    cover_artifact = _publish_local_cover_letter_docx(
+                        run_id, cover_draft, req.company_name, req.job_title)
+                    result["cover_letter_artifact"] = cover_artifact
+                    cover_pdf = _publish_pdf(cover_artifact)
+                    if cover_pdf:
+                        result["cover_letter_pdf_artifact"] = cover_pdf
+                except Exception as exc:  # noqa: BLE001 -- resume remains a successful run
+                    result["cover_letter_error"] = str(exc)
         with _local_runs_lock:
             _local_runs[run_id].update(
                 status="succeeded",
-                result={
-                    "draft": draft,
-                    "company_name": req.company_name,
-                    "job_title": req.job_title,
-                    "apply_url": req.apply_url,
-                },
+                result=result,
                 error=None,
             )
         # Same fire-and-forget completion callback as the cloud path.
@@ -3197,9 +3349,8 @@ def _run_local_tailor_in_background(run_id: str, req: LocalTailorRunRequest) -> 
                 status="failed", error=f"The tailoring model call did not succeed ({exc}).")
 
 
-@app.post("/agent/tailor/local")
-def agent_tailor_local(req: LocalTailorRunRequest):
-    """Enqueue a local tailor run (no cloud package, no auth, no DB)."""
+def _enqueue_local_tailor(req: LocalTailorRunRequest, package: bool = False):
+    """Enqueue a local tailor run, optionally including the local DOCX convenience render."""
     jd_text = (req.jd_text or "").strip()
     resume_text = (req.resume_text or "").strip()
     if not jd_text:
@@ -3214,7 +3365,7 @@ def agent_tailor_local(req: LocalTailorRunRequest):
     try:
         threading.Thread(
             target=_in_agent_slot,
-            args=(_run_local_tailor_in_background, run_id, req),
+            args=(_run_local_tailor_in_background, run_id, req, package),
             daemon=True,
             name=f"local-tailor-{run_id[:8]}",
         ).start()
@@ -3224,6 +3375,18 @@ def agent_tailor_local(req: LocalTailorRunRequest):
             del _local_runs[run_id]
         raise
     return JSONResponse(status_code=202, content={"run_id": run_id})
+
+
+@app.post("/agent/tailor/local")
+def agent_tailor_local(req: LocalTailorRunRequest):
+    """Enqueue a markdown-only local tailor run (no cloud package, no auth, no DB)."""
+    return _enqueue_local_tailor(req)
+
+
+@app.post("/agent/tailor/local/package")
+def agent_tailor_local_package(req: LocalTailorRunRequest):
+    """Enqueue a local tailor run with an unverified convenience DOCX render."""
+    return _enqueue_local_tailor(req, package=True)
 
 
 @app.get("/agent/runs/local/{run_id}")
