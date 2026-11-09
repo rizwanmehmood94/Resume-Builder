@@ -19,6 +19,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+# LibreOffice is used only when JOBRADAR_ENABLE_PDF=true. Keeping it in the image
+# makes optional PDF packaging reliable without involving an external converter.
+RUN apt-get update && apt-get install -y --no-install-recommends libreoffice-writer \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (leverages Docker layer cache on requirements changes).
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

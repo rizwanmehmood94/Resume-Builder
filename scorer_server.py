@@ -3182,7 +3182,7 @@ def _local_cover_letter_call(jd_text: str, resume_text: str, company: str, title
     if target["provider"] == "claude":
         import anthropic
         message = anthropic.Anthropic(api_key=(os.getenv("ANTHROPIC_API_KEY") or "").strip()).messages.create(
-            model=target["model"], max_tokens=1600, system=system,
+            model=target["model"], max_tokens=8000, system=system,
             messages=[{"role": "user", "content": user}],
         )
         text = "".join(block.text for block in message.content if getattr(block, "type", "") == "text")
@@ -3195,7 +3195,7 @@ def _local_cover_letter_call(jd_text: str, resume_text: str, company: str, title
             headers["Authorization"] = f"Bearer {target['api_key']}"
         request = urllib.request.Request(
             f"{target['base_url']}/chat/completions",
-            data=json.dumps({"model": target["model"], "max_tokens": 1600,
+            data=json.dumps({"model": target["model"],
                              "messages": [{"role": "system", "content": system},
                                           {"role": "user", "content": user}]}).encode("utf-8"),
             headers=headers, method="POST",
