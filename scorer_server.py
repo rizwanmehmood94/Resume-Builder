@@ -3077,7 +3077,8 @@ def _local_tailor_target() -> Dict[str, Any]:
             )
         return {"provider": "claude", "model": (os.getenv("TAILOR_MODEL") or "claude-sonnet-5").strip()}
 
-    base_url = (os.getenv("TAILOR_BASE_URL") or "").strip().rstrip("/")
+    runtime = _jobradar_llm_settings()
+    base_url = (runtime.get("baseUrl") or os.getenv("TAILOR_BASE_URL") or "").strip().rstrip("/")
     if base_url:
         # Auth is optional for an on-prem endpoint; when the endpoint DOES need
         # a key but TAILOR_API_KEY is unset, fall back to the deployment's
@@ -3088,7 +3089,7 @@ def _local_tailor_target() -> Dict[str, Any]:
         return {
             "provider": "openai-compatible",
             "base_url": base_url,
-            "model": (os.getenv("TAILOR_MODEL") or "").strip(),
+            "model": (runtime.get("model") or os.getenv("TAILOR_MODEL") or "").strip(),
             "api_key": api_key,
             "timeout": int((os.getenv("TAILOR_TIMEOUT") or "180").strip()),
         }
@@ -3172,6 +3173,23 @@ def _local_cover_letter_call(jd_text: str, resume_text: str, company: str, title
         "metrics, qualifications, employers, or experience. Return only a letter in markdown "
         "with a greeting, two or three short paragraphs, and a closing."
     )
+
+
+def _jobradar_llm_settings() -> Dict[str, str]:
+    """Read non-secret runtime settings from Job Radar, falling back to local env on failure."""
+    endpoint = (os.getenv("JOBRADAR_LLM_CONFIG_URL") or "").strip()
+    if not endpoint:
+        return {}
+    try:
+        import urllib.request
+        with urllib.request.urlopen(endpoint, timeout=2) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        base_url, model = body.get("baseUrl"), body.get("model")
+        if isinstance(base_url, str) and isinstance(model, str) and base_url.strip() and model.strip():
+            return {"baseUrl": base_url.strip(), "model": model.strip()}
+    except Exception as exc:  # noqa: BLE001 -- tailoring must retain its local env fallback
+        print(f"[/agent/tailor/local] Job Radar LLM settings unavailable; using TAILOR_* env: {exc}")
+    return {}
     user = (
         f"JOB DESCRIPTION:\n{jd_text}\n\nRESUME:\n{resume_text}\n\n"
         f"COMPANY: {company or 'Hiring team'}\nROLE: {title or 'the advertised role'}"
